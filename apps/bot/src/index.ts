@@ -16,7 +16,7 @@ import {
 } from '@discordjs/voice';
 import WebSocket from 'ws';
 import { Readable } from 'stream';
-import OpusScript from 'opusscript';
+import { Transform } from 'stream';
 import prism from 'prism-media';
 import axios from 'axios';
 
@@ -120,7 +120,7 @@ async function createRealtimeSession(): Promise<OpenAISession> {
 					type: "server_vad",
 					threshold: 0.5,
 					prefix_padding_ms: 300,
-					silence_duration_ms: 500,
+					silence_duration_ms: 1000,
 					create_response: true
 				}
 			},
@@ -199,13 +199,17 @@ function setupVoiceProcessing(connection: VoiceConnection, ws: WebSocket, player
 	let isProcessingAudio = false;
 	const MIN_BUFFER_SIZE = 4800; // 100ms at 48kHz
 
+	// Create a transform stream to handle audio chunks
+	const audioBufferStream = new Transform({
+		transform(chunk: Buffer, encoding, callback) {
+			this.push(chunk);
+			callback();
+		}
+	});
+
 	// Add player state logging
 	player.on('stateChange', (oldState, newState) => {
 		client.logger.debug(`Audio player state changed from ${oldState.status} to ${newState.status}`);
-		
-		if (newState.status === 'idle' && oldState.status !== 'playing') {
-			client.logger.debug('Audio player entered idle state unexpectedly, attempting to recover...');
-		}
 	});
 
 	player.on('error', error => {
@@ -241,13 +245,37 @@ function setupVoiceProcessing(connection: VoiceConnection, ws: WebSocket, player
 					client.logger.info('Session created:', message.session?.id);
 					break;
 
+				case 'input_audio_buffer.speech_started':
+					client.logger.info('Speech started');
+					break;
+
+				case 'input_audio_buffer.speech_stopped':
+					client.logger.info('Speech stopped');
+					break;
+
+				case 'response.created':
+					client.logger.info('AI starting to respond...');
+					break;
+
+				case 'response.text.delta':
+					if (message.delta) {
+						client.logger.info('AI text:', message.delta);
+					}
+					break;
+
+				case 'response.audio_transcript.delta':
+					if (message.delta) {
+						client.logger.debug('AI transcript:', message.delta);
+					}
+					break;
+
 				case 'response.audio.delta':
 					if (message.delta) {
 						try {
 							// Decode base64 audio data to PCM
 							const pcmData = Buffer.from(message.delta, 'base64');
 							
-							// Create a readable stream from the PCM data
+							// Create a readable stream and pipe through the transform
 							const pcmStream = new Readable({
 								read() {
 									this.push(pcmData);
@@ -255,18 +283,23 @@ function setupVoiceProcessing(connection: VoiceConnection, ws: WebSocket, player
 								}
 							});
 
-							// Create an Opus encoder stream
-							const opusEncoder = new prism.opus.Encoder({
+							// Create an Opus encoder stream with proper settings
+							const opusStream = new prism.opus.Encoder({
 								rate: 48000,
 								channels: 1,
 								frameSize: 960
 							});
 
-							// Create a resource from the Opus stream
-							const resource = createAudioResource(pcmStream.pipe(opusEncoder), {
-								inputType: StreamType.Opus,
-								inlineVolume: true
-							});
+							// Create the audio resource from the stream pipeline
+							const resource = createAudioResource(
+								pcmStream
+									.pipe(audioBufferStream)
+									.pipe(opusStream),
+								{
+									inputType: StreamType.Opus,
+									inlineVolume: true
+								}
+							);
 
 							if (resource.volume) {
 								resource.volume.setVolume(1.5);
@@ -279,9 +312,16 @@ function setupVoiceProcessing(connection: VoiceConnection, ws: WebSocket, player
 					}
 					break;
 
+				case 'response.done':
+					client.logger.info('AI response complete');
+					break;
+
 				case 'error':
 					client.logger.error('OpenAI Error:', message.error);
 					break;
+
+				default:
+					client.logger.debug('Unhandled message type:', message.type);
 			}
 		} catch (error) {
 			client.logger.error('Error processing message:', error);
@@ -303,14 +343,32 @@ function setupVoiceProcessing(connection: VoiceConnection, ws: WebSocket, player
 			},
 		});
 
+		// Create a pipeline to convert Opus to PCM16
 		const opusDecoder = new prism.opus.Decoder({
 			rate: 48000,
 			channels: 1,
 			frameSize: 960
 		});
 
+		// Create a transform to convert to 16-bit PCM
+		const pcmTransform = new Transform({
+			transform(chunk: Buffer, encoding, callback) {
+				// Convert the Float32 PCM to Int16 PCM
+				const int16Buffer = Buffer.alloc(chunk.length / 4 * 2);
+				for (let i = 0; i < chunk.length / 4; i++) {
+					const sample = chunk.readFloatLE(i * 4);
+					// Convert float to int16
+					const int16Sample = Math.max(-32768, Math.min(32767, Math.floor(sample * 32768)));
+					int16Buffer.writeInt16LE(int16Sample, i * 2);
+				}
+				this.push(int16Buffer);
+				callback();
+			}
+		});
+
 		audioStream
 			.pipe(opusDecoder)
+			.pipe(pcmTransform)
 			.on('data', (chunk: Buffer) => {
 				if (!isProcessingAudio) return;
 				
@@ -329,6 +387,8 @@ function setupVoiceProcessing(connection: VoiceConnection, ws: WebSocket, player
 			})
 			.on('error', (error) => {
 				client.logger.error('Audio processing error:', error);
+				isProcessingAudio = false;
+				audioBuffer = [];
 			});
 	});
 
@@ -352,9 +412,17 @@ function setupVoiceProcessing(connection: VoiceConnection, ws: WebSocket, player
 		isProcessingAudio = false;
 		audioBuffer = [];
 
-		// Commit the audio buffer
+		// Commit the audio buffer and create response
 		ws.send(JSON.stringify({
 			type: 'input_audio_buffer.commit'
+		}));
+
+		// Create a response after committing
+		ws.send(JSON.stringify({
+			type: 'response.create',
+			response: {
+				modalities: ['text', 'audio']
+			}
 		}));
 	});
 }
