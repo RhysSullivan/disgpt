@@ -1,0 +1,9 @@
+{
+	"extends": "@acme/tsconfig/base.json",
+	"include": ["src", "../../reset.d.ts"],
+	"compilerOptions": {
+		"outDir": "./dist",
+		"rootDir": "./src",
+		"noEmit": false
+	}
+}

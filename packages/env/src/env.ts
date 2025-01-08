@@ -74,13 +74,6 @@ export function zStringDefaultInDev(defaultValue: string) {
 	return z.string().optional().default(defaultValue);
 }
 
-export const sharedClientEnvs = {
-	NEXT_PUBLIC_POSTHOG_TOKEN: zStringRequiredInProduction,
-	NEXT_PUBLIC_DEPLOYMENT_ENV: zStringDefaultInDev('local').pipe(
-		z.enum(['local', 'staging', 'production', 'ci']),
-	),
-	NEXT_PUBLIC_SITE_URL: zStringDefaultInDev('http://localhost:3000'),
-};
 
 export const sharedEnvs = createEnv({
 	server: {
@@ -89,18 +82,14 @@ export const sharedEnvs = createEnv({
 			'http://root:nonNullPassword@localhost:3900',
 		),
 		/*
-      Analytics
+      Analytics	
      */
 		POSTHOG_PROJECT_ID: zNumberRequiredInProduction,
 		POSTHOG_PERSONAL_API_KEY: zStringRequiredInProduction,
 		AXIOM_API_KEY: zStringRequiredInProduction,
+		DISCORD_TOKEN: zStringRequiredInProduction,
 	},
-	client: sharedClientEnvs,
 	experimental__runtimeEnv: {
-		NEXT_PUBLIC_DEPLOYMENT_ENV: process.env.NEXT_PUBLIC_DEPLOYMENT_ENV,
-		NEXT_PUBLIC_POSTHOG_TOKEN: process.env.NEXT_PUBLIC_POSTHOG_TOKEN,
-		NEXT_PUBLIC_SITE_URL: process.env.NEXT_PUBLIC_SITE_URL,
 	},
-
 	skipValidation: process.env.SKIP_ENV_CHECK === 'true',
 });
