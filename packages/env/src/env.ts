@@ -88,6 +88,7 @@ export const sharedEnvs = createEnv({
 		POSTHOG_PERSONAL_API_KEY: zStringRequiredInProduction,
 		AXIOM_API_KEY: zStringRequiredInProduction,
 		DISCORD_TOKEN: zStringRequiredInProduction,
+		OPENAI_API_KEY: zStringRequiredInProduction,
 	},
 	experimental__runtimeEnv: {
 	},
