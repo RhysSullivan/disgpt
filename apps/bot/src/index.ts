@@ -3,45 +3,68 @@ import {
 	SapphireClient,
 } from '@sapphire/framework';
 import { sharedEnvs } from '@acme/env/env';
-import { Partials, VoiceBasedChannel } from 'discord.js';
+import { Partials } from 'discord.js';
 import type { ClientOptions } from 'discord.js';
 import { 
-	joinVoiceChannel, 
-	VoiceConnectionStatus,
+	joinVoiceChannel,
 	createAudioPlayer,
 	createAudioResource,
-	EndBehaviorType,
+	StreamType,
 	VoiceConnection,
-	AudioPlayerStatus
+	AudioPlayer,
+	EndBehaviorType,
 } from '@discordjs/voice';
-import OpenAI from 'openai';
+import WebSocket from 'ws';
+import { Readable } from 'stream';
 import OpusScript from 'opusscript';
-import * as fs from 'fs';
-import * as prism from 'prism-media';
+import prism from 'prism-media';
 import axios from 'axios';
-const ffmpeg = require('fluent-ffmpeg');
 
-const openai = new OpenAI({
-	apiKey: sharedEnvs.OPENAI_API_KEY,
-});
-
-// Create an Opus encoder for audio processing
-const encoder = new OpusScript(48000, 2);
-
-// Create recordings directory if it doesn't exist
-if (!fs.existsSync('./recordings')) {
-    fs.mkdirSync('./recordings');
+// Types for OpenAI Realtime API
+interface OpenAISession {
+	id: string;
+	object: string;
+	model: string;
+	modalities: string[];
+	instructions?: string;
+	voice: string;
+	input_audio_format: string;
+	output_audio_format: string;
+	input_audio_transcription: null | { model: string };
+	turn_detection: null | {
+		type: string;
+		threshold: number;
+		prefix_padding_ms: number;
+		silence_duration_ms: number;
+	};
+	tools: any[];
+	tool_choice: string;
+	temperature: number;
+	max_response_output_tokens: number | string;
+	client_secret?: {
+		value: string;
+		expires_at: number;
+	};
 }
 
-// Create sounds directory if it doesn't exist
-if (!fs.existsSync('./sounds')) {
-    fs.mkdirSync('./sounds');
+// Types for WebSocket messages
+interface OpenAIMessage {
+	type: string;
+	session?: {
+		id: string;
+	};
+	delta?: string;
+	error?: {
+		message: string;
+		type: string;
+		code: string;
+	};
 }
 
 export function createClient(override: Partial<ClientOptions> = {}) {
 	return new SapphireClient({
 		logger: {
-			level: LogLevel.Debug,
+				level: LogLevel.Debug,
 		},
 		shards: 'auto',
 		intents: [
@@ -79,6 +102,42 @@ const zoomer = {
 
 const ids = zoomer;
 
+async function createRealtimeSession(): Promise<OpenAISession> {
+	try {
+		const response = await axios.post(
+			'https://api.openai.com/v1/realtime/sessions',
+			{
+				model: "gpt-4o-realtime-preview-2024-12-17",
+				modalities: ["audio", "text"],
+				instructions: "You are a helpful AI assistant. Keep your responses concise and natural.",
+				voice: "alloy",
+				input_audio_format: "pcm16",
+				output_audio_format: "pcm16",
+				input_audio_transcription: {
+					model: "whisper-1"
+				},
+				turn_detection: {
+					type: "server_vad",
+					threshold: 0.5,
+					prefix_padding_ms: 300,
+					silence_duration_ms: 500,
+					create_response: true
+				}
+			},
+			{
+				headers: {
+					'Authorization': `Bearer ${sharedEnvs.OPENAI_API_KEY}`,
+					'Content-Type': 'application/json'
+				}
+			}
+		);
+		return response.data;
+	} catch (error) {
+		console.error('Failed to create realtime session:', error);
+		throw error;
+	}
+}
+
 async function setupVoiceConnection(client: SapphireClient) {
 	const guild = await client.guilds.fetch(ids.guild);
 	if (!guild) {
@@ -100,178 +159,204 @@ async function setupVoiceConnection(client: SapphireClient) {
 		selfDeaf: false,
 	});
 
-	// Handle connection ready state
-	connection.on(VoiceConnectionStatus.Ready, () => {
-		console.log('Voice connection is ready!');
-		// Start recording for all members in the channel
-		voiceChannel.members.forEach(member => {
-			if (!member.user.bot) {
-				handleRecording(member.user.id, connection, voiceChannel);
+	const player = createAudioPlayer();
+	connection.subscribe(player);
+
+	try {
+		// Create a realtime session first
+		const session = await createRealtimeSession();
+		client.logger.info('Created realtime session:', session.id);
+
+		// Set up WebSocket connection using the session token
+		const ws = new WebSocket(`wss://api.openai.com/v1/realtime`, {
+			headers: {
+				'Authorization': `Bearer ${session.client_secret?.value}`,
+				'OpenAI-Beta': 'realtime=v1'
 			}
 		});
+
+		ws.on('open', () => {
+			client.logger.info('Connected to OpenAI Realtime API');
+			setupVoiceProcessing(connection, ws, player, client);
+		});
+
+		ws.on('error', (error) => {
+			client.logger.error('WebSocket error:', error);
+		});
+
+		return connection;
+	} catch (error) {
+		client.logger.error('Failed to setup voice connection:', error);
+		throw error;
+	}
+}
+
+function setupVoiceProcessing(connection: VoiceConnection, ws: WebSocket, player: AudioPlayer, client: SapphireClient) {
+	client.logger.info('Voice processing initialized');
+
+	// Buffer to accumulate audio data
+	let audioBuffer: Buffer[] = [];
+	let isProcessingAudio = false;
+	const MIN_BUFFER_SIZE = 4800; // 100ms at 48kHz
+
+	// Add player state logging
+	player.on('stateChange', (oldState, newState) => {
+		client.logger.debug(`Audio player state changed from ${oldState.status} to ${newState.status}`);
+		
+		if (newState.status === 'idle' && oldState.status !== 'playing') {
+			client.logger.debug('Audio player entered idle state unexpectedly, attempting to recover...');
+		}
 	});
 
-	// Handle connection errors
-	connection.on('error', (error) => {
-		console.error('Voice connection error:', error);
+	player.on('error', error => {
+		client.logger.error('Audio player error:', error);
+		try {
+			player.stop();
+		} catch (e) {
+			client.logger.error('Failed to stop player after error:', e);
+		}
 	});
 
-	return connection;
-}
+	connection.on('stateChange', (oldState, newState) => {
+		client.logger.debug(`Voice connection state changed from ${oldState.status} to ${newState.status}`);
+		
+		if (newState.status === 'disconnected') {
+			client.logger.warn('Voice connection disconnected, attempting to reconnect...');
+			try {
+				connection.rejoin();
+			} catch (e) {
+				client.logger.error('Failed to rejoin voice channel:', e);
+			}
+		}
+	});
 
-function handleRecording(userId: string, connection: VoiceConnection, channel: VoiceBasedChannel) {
-	const client = channel.client;
-    const receiver = connection.receiver;
-    client.logger.debug(`Started listening to user ${userId}`);
-    
-    const filePath = `./recordings/${userId}.pcm`;
-    const writeStream = fs.createWriteStream(filePath);
-    
-    // Add speaking event handlers
-    receiver.speaking.on('start', userId => {
-        client.logger.debug(`User ${userId} started speaking`);
-    });
+	// Handle WebSocket messages
+	ws.on('message', (rawData) => {
+		try {
+			const message = JSON.parse(rawData.toString()) as OpenAIMessage;
+			client.logger.debug('Received message type:', message.type);
 
-    receiver.speaking.on('end', userId => {
-        client.logger.debug(`User ${userId} stopped speaking`);
-    });
-    
-    const listenStream = receiver.subscribe(userId, {
-        end: {
-            behavior: EndBehaviorType.AfterSilence,
-            duration: 1000, // 1 second of silence before ending
-        },
-    });
+			switch (message.type) {
+				case 'session.created':
+					client.logger.info('Session created:', message.session?.id);
+					break;
 
-    const opusDecoder = new prism.opus.Decoder({
-        frameSize: 960,
-        channels: 1,
-        rate: 48000,
-    });
+				case 'response.audio.delta':
+					if (message.delta) {
+						try {
+							// Decode base64 audio data to PCM
+							const pcmData = Buffer.from(message.delta, 'base64');
+							
+							// Create a readable stream from the PCM data
+							const pcmStream = new Readable({
+								read() {
+									this.push(pcmData);
+									this.push(null);
+								}
+							});
 
-    listenStream.pipe(opusDecoder).pipe(writeStream);
+							// Create an Opus encoder stream
+							const opusEncoder = new prism.opus.Encoder({
+								rate: 48000,
+								channels: 1,
+								frameSize: 960
+							});
 
-    writeStream.on('finish', () => {
-        client.logger.debug(`Recording finished for user ${userId}`);
-        convertAndTranscribe(filePath, userId, connection, channel);
-    });
-}
+							// Create a resource from the Opus stream
+							const resource = createAudioResource(pcmStream.pipe(opusEncoder), {
+								inputType: StreamType.Opus,
+								inlineVolume: true
+							});
 
-async function convertAndTranscribe(filePath: string, userId: string, connection: VoiceConnection, channel: VoiceBasedChannel) {
-    const mp3Path = filePath.replace('.pcm', '.mp3');
-    const client = channel.client;
-    
-    // Convert PCM to MP3
-    ffmpeg(filePath)
-        .inputFormat('s16le')
-        .audioChannels(1)
-        .audioFrequency(48000)
-        .format('mp3')
-        .on('end', async () => {
-            client.logger.debug('Audio conversion finished');
-            
-            try {
-                // Create form data for OpenAI API
-                const file = fs.createReadStream(mp3Path);
-                const transcript = await openai.audio.transcriptions.create({
-                    file,
-                    model: "whisper-1",
-                });
+							if (resource.volume) {
+								resource.volume.setVolume(1.5);
+							}
 
-                client.logger.debug(`Transcription for ${userId}:`);
-                client.logger.debug(`"${transcript.text}"`);
+							player.play(resource);
+						} catch (error) {
+							client.logger.error('Error processing audio delta:', error);
+						}
+					}
+					break;
 
-                // Generate and play response
-                await generateAndPlayResponse(transcript.text, connection, channel);
+				case 'error':
+					client.logger.error('OpenAI Error:', message.error);
+					break;
+			}
+		} catch (error) {
+			client.logger.error('Error processing message:', error);
+		}
+	});
 
-                // Clean up files
-                fs.unlinkSync(filePath);
-                fs.unlinkSync(mp3Path);
-                
-                // Start listening again
-                handleRecording(userId, connection, channel);
-            } catch (error) {
-                console.error('Transcription error:', error);
-                // Clean up files even if transcription fails
-                try {
-                    fs.unlinkSync(filePath);
-                    fs.unlinkSync(mp3Path);
-                } catch (cleanupError) {
-                    console.error('Cleanup error:', cleanupError);
-                }
-            }
-        })
-        .on('error', (err: Error) => {
-            console.error('Conversion error:', err);
-            try {
-                fs.unlinkSync(filePath);
-            } catch (cleanupError) {
-                console.error('Cleanup error:', cleanupError);
-            }
-        })
-        .save(mp3Path);
-}
+	// Handle voice input
+	connection.receiver.speaking.on('start', async (userId) => {
+		if (userId !== '523949187663134754') return;
 
-async function generateAndPlayResponse(userMessage: string, connection: VoiceConnection, channel: VoiceBasedChannel) {
-    const client = channel.client;
-    try {
-        // Generate response using OpenAI
-        const completion = await openai.chat.completions.create({
-            model: "gpt-3.5-turbo",
-            messages: [
-                {
-                    role: "system",
-                    content: "You are a helpful assistant. Keep your responses concise and natural, as they will be spoken aloud."
-                },
-                {
-                    role: "user",
-                    content: userMessage
-                }
-            ],
-            max_tokens: 150
-        });
+		const user = await client.users.fetch(userId);
+		client.logger.info(`User ${user.username} started speaking`);
+		audioBuffer = [];
+		isProcessingAudio = true;
 
-        const response = completion.choices[0]?.message?.content;
-        if (!response) {
-            client.logger.error('No response generated from OpenAI');
-            return;
-        }
-        
-        client.logger.debug(`Generated response: "${response}"`);
+		const audioStream = connection.receiver.subscribe(userId, {
+			end: {
+				behavior: EndBehaviorType.Manual,
+			},
+		});
 
-        // Convert response to speech
-        const speechResponse = await openai.audio.speech.create({
-            model: "tts-1",
-            voice: "alloy",
-            input: response
-        });
+		const opusDecoder = new prism.opus.Decoder({
+			rate: 48000,
+			channels: 1,
+			frameSize: 960
+		});
 
-        // Save the audio buffer to a file
-        const audioBuffer = Buffer.from(await speechResponse.arrayBuffer());
-        const outputFile = `./sounds/response_${Date.now()}.mp3`;
-        fs.writeFileSync(outputFile, audioBuffer);
+		audioStream
+			.pipe(opusDecoder)
+			.on('data', (chunk: Buffer) => {
+				if (!isProcessingAudio) return;
+				
+				// Accumulate audio data
+				audioBuffer.push(chunk);
+				
+				// Only send if we have enough data
+				if (Buffer.concat(audioBuffer).length >= MIN_BUFFER_SIZE) {
+					const audioData = Buffer.concat(audioBuffer);
+					ws.send(JSON.stringify({
+						type: 'input_audio_buffer.append',
+						audio: audioData.toString('base64')
+					}));
+					audioBuffer = [];
+				}
+			})
+			.on('error', (error) => {
+				client.logger.error('Audio processing error:', error);
+			});
+	});
 
-        // Play the audio
-        const player = createAudioPlayer();
-        const resource = createAudioResource(outputFile);
+	connection.receiver.speaking.on('end', async (userId) => {
+		if (userId !== '523949187663134754') return;
 
-        player.play(resource);
-        connection.subscribe(player);
+		const user = await client.users.fetch(userId);
+		client.logger.info(`User ${user.username} stopped speaking`);
+		
+		// Send any remaining buffered audio
+		if (audioBuffer.length > 0) {
+			const audioData = Buffer.concat(audioBuffer);
+			if (audioData.length >= MIN_BUFFER_SIZE) {
+				ws.send(JSON.stringify({
+					type: 'input_audio_buffer.append',
+					audio: audioData.toString('base64')
+				}));
+			}
+		}
+		
+		isProcessingAudio = false;
+		audioBuffer = [];
 
-        // Clean up after playing
-        player.on(AudioPlayerStatus.Idle, () => {
-            fs.unlinkSync(outputFile);
-            client.logger.debug('Finished playing response');
-        });
-
-        player.on('error', error => {
-            client.logger.error('Error playing audio:', error);
-            fs.unlinkSync(outputFile);
-        });
-
-    } catch (error) {
-        client.logger.error('Error generating or playing response:', error);
-    }
+		// Commit the audio buffer
+		ws.send(JSON.stringify({
+			type: 'input_audio_buffer.commit'
+		}));
+	});
 }
 
 export const login = async (client: SapphireClient) => {

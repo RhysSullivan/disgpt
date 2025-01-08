@@ -24,6 +24,7 @@
 		"@sentry/tracing": "^7.64.0",
 		"@trpc/server": "^10.45.2",
 		"@types/node": "^22.10.5",
+		"axios": "^1.7.9",
 		"colorette": "^2.0.20",
 		"cron": "^3.1.7",
 		"discord-api-types": "^0.37.67",
@@ -39,8 +40,7 @@
 		"reflect-metadata": "^0.1.13",
 		"rxjs": "^7.8.1",
 		"sodium-native": "^4.3.1",
-		"zod": "^3.22.2",
-		"axios": "^1.6.7"
+		"zod": "^3.22.2"
 	},
 	"devDependencies": {
 		"@acme/tsconfig": "workspace:*",
