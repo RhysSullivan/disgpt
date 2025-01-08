@@ -11,12 +11,14 @@ import {
 	createAudioPlayer,
 	createAudioResource,
 	EndBehaviorType,
-	VoiceConnection
+	VoiceConnection,
+	AudioPlayerStatus
 } from '@discordjs/voice';
 import OpenAI from 'openai';
 import OpusScript from 'opusscript';
 import * as fs from 'fs';
 import * as prism from 'prism-media';
+import axios from 'axios';
 const ffmpeg = require('fluent-ffmpeg');
 
 const openai = new OpenAI({
@@ -29,6 +31,11 @@ const encoder = new OpusScript(48000, 2);
 // Create recordings directory if it doesn't exist
 if (!fs.existsSync('./recordings')) {
     fs.mkdirSync('./recordings');
+}
+
+// Create sounds directory if it doesn't exist
+if (!fs.existsSync('./sounds')) {
+    fs.mkdirSync('./sounds');
 }
 
 export function createClient(override: Partial<ClientOptions> = {}) {
@@ -60,17 +67,26 @@ export function createClient(override: Partial<ClientOptions> = {}) {
 	});
 }
 
-const guildId = '1037547185492996207';
-const voiceChannelId = '1037547185492996211';
+const test = {
+	guild: '1037547185492996207',
+	voiceChannel: '1037547185492996211'
+};
+
+const zoomer = {
+	guild: '1315920303507111956',
+	voiceChannel: '1315920303989329953'
+}
+
+const ids = zoomer;
 
 async function setupVoiceConnection(client: SapphireClient) {
-	const guild = await client.guilds.fetch(guildId);
+	const guild = await client.guilds.fetch(ids.guild);
 	if (!guild) {
 		client.logger.error('No guild found');
 		return;
 	}
 
-	const voiceChannel = await guild.channels.fetch(voiceChannelId);
+	const voiceChannel = await guild.channels.fetch(ids.voiceChannel);
 	if (!voiceChannel?.isVoiceBased()) {
 		client.logger.error('Voice channel not found or is not a voice channel');
 		return;
@@ -144,6 +160,7 @@ function handleRecording(userId: string, connection: VoiceConnection, channel: V
 async function convertAndTranscribe(filePath: string, userId: string, connection: VoiceConnection, channel: VoiceBasedChannel) {
     const mp3Path = filePath.replace('.pcm', '.mp3');
     const client = channel.client;
+    
     // Convert PCM to MP3
     ffmpeg(filePath)
         .inputFormat('s16le')
@@ -163,6 +180,9 @@ async function convertAndTranscribe(filePath: string, userId: string, connection
 
                 client.logger.debug(`Transcription for ${userId}:`);
                 client.logger.debug(`"${transcript.text}"`);
+
+                // Generate and play response
+                await generateAndPlayResponse(transcript.text, connection, channel);
 
                 // Clean up files
                 fs.unlinkSync(filePath);
@@ -190,6 +210,68 @@ async function convertAndTranscribe(filePath: string, userId: string, connection
             }
         })
         .save(mp3Path);
+}
+
+async function generateAndPlayResponse(userMessage: string, connection: VoiceConnection, channel: VoiceBasedChannel) {
+    const client = channel.client;
+    try {
+        // Generate response using OpenAI
+        const completion = await openai.chat.completions.create({
+            model: "gpt-3.5-turbo",
+            messages: [
+                {
+                    role: "system",
+                    content: "You are a helpful assistant. Keep your responses concise and natural, as they will be spoken aloud."
+                },
+                {
+                    role: "user",
+                    content: userMessage
+                }
+            ],
+            max_tokens: 150
+        });
+
+        const response = completion.choices[0]?.message?.content;
+        if (!response) {
+            client.logger.error('No response generated from OpenAI');
+            return;
+        }
+        
+        client.logger.debug(`Generated response: "${response}"`);
+
+        // Convert response to speech
+        const speechResponse = await openai.audio.speech.create({
+            model: "tts-1",
+            voice: "alloy",
+            input: response
+        });
+
+        // Save the audio buffer to a file
+        const audioBuffer = Buffer.from(await speechResponse.arrayBuffer());
+        const outputFile = `./sounds/response_${Date.now()}.mp3`;
+        fs.writeFileSync(outputFile, audioBuffer);
+
+        // Play the audio
+        const player = createAudioPlayer();
+        const resource = createAudioResource(outputFile);
+
+        player.play(resource);
+        connection.subscribe(player);
+
+        // Clean up after playing
+        player.on(AudioPlayerStatus.Idle, () => {
+            fs.unlinkSync(outputFile);
+            client.logger.debug('Finished playing response');
+        });
+
+        player.on('error', error => {
+            client.logger.error('Error playing audio:', error);
+            fs.unlinkSync(outputFile);
+        });
+
+    } catch (error) {
+        client.logger.error('Error generating or playing response:', error);
+    }
 }
 
 export const login = async (client: SapphireClient) => {

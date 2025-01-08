@@ -47,3 +47,6 @@ dist/
 # Contentlayer
 .contentlayer
 .cache
+
+recordings/
+sounds/
